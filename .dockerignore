@@ -1,0 +1,58 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Python（容器内自己装）
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+.pytest_cache
+
+# Node（容器内自己装）
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# 数据（容器卷挂载会覆盖，避免把本地 DB 拷进去）
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/qdii-cache/
+
+# macOS
+.DS_Store
+
+# 文档 / 记忆 / 项目级
+README.md
+CLAUDE.md
+memory/
+.deploy/
+
+# 日志 / 临时
+*.log
+/tmp/
+/var/
+
+# 构建产物
+*.tar
+*.tar.gz
+
+# 部署 / 启动脚本（容器内不会用到）
+deploy-source.sh
+start.sh
+
+# 报告 / 一次性产物
+report/

@@ -1,0 +1,52 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fund-assistant:latest
+    container_name: fund-assistant
+    restart: unless-stopped
+
+    ports:
+      - "80:80"
+
+    environment:
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+      FEISHU_CHAT_ID: ${FEISHU_CHAT_ID:-}
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-true}
+      SCHEDULER_TIMEZONE: ${SCHEDULER_TIMEZONE:-Asia/Shanghai}
+      QDII_CACHE_DIR: /app/data/qdii-cache
+
+      # Dev 模式开关（保留接口，当前默认 false；手动 export DEV_RELOAD=1 时启用）
+      DEV_RELOAD: ${DEV_RELOAD:-false}
+
+      TZ: Asia/Shanghai
+
+    volumes:
+      # SQLite + 缓存持久化（必须 bind，数据不能丢）
+      - ./data:/app/data
+
+      # 源码 bind mount：改 backend/scripts/*.py 后 docker compose restart 即生效，免 rebuild
+      - ./backend:/app/backend
+      - ./scripts:/app/scripts
+
+    deploy:
+      resources:
+        limits:
+          memory: 800M
+        reservations:
+          memory: 200M
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
