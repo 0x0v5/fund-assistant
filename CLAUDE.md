@@ -142,7 +142,7 @@ curl http://localhost/api/notify/status    # 看凭据是否配置
 
 > **环境变量约定**：所有部署命令用 `$N1_HOST`（格式 `user@host`），首次部署前 `export` 一次即可：
 > ```bash
-> export N1_HOST=root@192.168.50.254    # 改成你自己的 N1 地址
+> export N1_HOST=root@<N1_IP>    # 改成你自己的 N1 地址
 > ```
 
 ### N1 单容器（典型场景）

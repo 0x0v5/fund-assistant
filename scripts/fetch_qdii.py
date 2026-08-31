@@ -3,12 +3,12 @@
 QDII 场外基金额度检查脚本
 
 两种调用方式：
-1. CLI（兼容 hermes cron）：`python scripts/fetch_qdii.py`
+1. CLI：`python scripts/fetch_qdii.py`
 2. APScheduler in-process：`from scripts.fetch_qdii import run; await run()`
 
 环境变量：
 - FUND_API_BASE     后端 API 地址（默认 http://localhost:8000）
-- QDII_CACHE_DIR    限额历史缓存目录（默认 ~/.hermes/cache，容器内建议指向持久卷）
+- QDII_CACHE_DIR    限额历史缓存目录（默认 ~/.cache/qdii，容器内建议指向持久卷）
 """
 
 import httpx

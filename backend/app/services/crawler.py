@@ -334,9 +334,12 @@ class FundDataService:
 
     @staticmethod
     def get_fund_nav(fund_code: str) -> pd.DataFrame:
-        """获取场外基金净值数据."""
+        """获取场外基金净值数据.
+
+        暂未启用，预留扩展点。场外净值目前走 ``fund_nav`` 表的 ``code+date`` 历史
+        写入路径（见 ``run_momentum.py`` 同步 ETF 收盘价），不在此处即时抓取。
+        """
         import pandas as pd  # lazy（占位实现，仅返回空表）
-        # TODO: 实现场外基金净值获取
         return pd.DataFrame()
 
 

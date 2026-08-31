@@ -30,10 +30,10 @@
 - 工作日 10:00 推送飞书
 
 ### 2. ETF 双动量轮动策略
-- 4 只代表性 ETF：创业板、红利低波、纳斯达克、黄金
+- 默认 4 只代表性 ETF（创业板、红利低波、纳斯达克、黄金），标的池**可在前端 CRUD 管理**（无需改代码）
 - 激进型：综合评分 = 100% × 短期动量
 - 保守型：综合评分 = 20 日夏普比率
-- 满仓持有排名第 1 的 ETF
+- **连续 N 天排名第一才推荐买入**（默认 N=3），减少噪声切换
 - 价格 < 60日线 → 强制卖出/观望
 - 工作日 14:30 推送飞书
 
@@ -90,7 +90,7 @@
 
 ```bash
 # 格式: user@host，改成你自己的 N1 登录地址
-export N1_HOST=root@192.168.50.254
+export N1_HOST=root@<N1_IP>
 # 浏览器访问用的纯 IP（从 $N1_HOST 派生，去掉 user@ 前缀）
 export N1_IP="${N1_HOST#*@}"
 ```
@@ -208,6 +208,25 @@ fund-assistant/
 └── README.md                   # 本文件
 ```
 
+### 数据库备份
+
+`scripts/backup_db.py` 用 SQLite `Connection.backup()` 做热备份（WAL 安全，不锁库）：
+
+```bash
+# 默认：./data/backups/fund-YYYY-MM-DD.db
+python3 scripts/backup_db.py
+
+# 自定义路径 / 源 DB
+python3 scripts/backup_db.py --src ./data/fund.db --dst /mnt/usb/backup/
+```
+
+建议挂 cron 每天 03:00 跑一次，保留 30 天：
+
+```cron
+0 3 * * * cd /path/to/fund-assistant && python3 scripts/backup_db.py && \
+    find ./data/backups -mtime +30 -name 'fund-*.db' -delete
+```
+
 ---
 
 ## 功能模块详解
@@ -251,6 +270,29 @@ fund-assistant/
 - 价格在60日线上方: 持有
 - 价格在60日线下方: 卖出
 ```
+
+#### 标的池管理（v2.1.0+）
+
+ETF 池通过 `etf_pool` 表 + 前端抽屉 UI 管理，**不再硬编码在源码里**：
+
+- **字段**：`code / name / type / short_name / sort_order / is_active`
+- **新增/修改**：前端 ETF 页面 → "标的池管理" 按钮 → 抽屉底部表单
+- **删除**：走软删除（`is_active=0`），保留历史动量数据
+- **飞书推送短名**：从池子 `short_name` 取，缺则回退 `name[:3]`
+- **回测**：标的池是参数 `universe` 列表，回测独立于实时池
+
+修改后无需重启——前端 CRUD 直接落 DB，下次 cron 刷新或前端拉取即生效。
+
+#### 连续 N 天动量排名第一（v2.1.0+）
+
+实时信号、回测、飞书推送三处口径统一：
+
+- **阈值 N=3**（默认）：ETF 需**连续 3 天**排名 #1 才触发"建议满仓"信号
+- **N=1**：退化为旧行为（单日排名即推荐）
+- **前端展示**：候选表「连续第 1 天数」列（绿 = ≥3 满仓 / 灰 = 观察中）
+- **回测参数**：`consecutive_rank1_days`（默认 3），可对比 consec=1 vs consec=3 表现
+
+设计动机：单日第一名次日经常被挤掉，导致频繁换手；连续天数门槛让信号更稳定。
 
 ### A 股行业板块监测
 
@@ -328,6 +370,19 @@ fund-assistant/
 ---
 
 ## 更新日志
+
+### v2.1.0 (2026-08-31)
+
+**ETF 策略升级 + 文档完善**
+- ✨ ETF 标的池改为 DB 管理（`etf_pool` 表），前端抽屉 CRUD，无需改代码
+- ✨ 新增「连续 N 天动量排名第一」策略（默认 N=3），实时 / 回测 / 推送三处口径统一
+- ✨ 回测增加 `consecutive_rank1_days` 参数（=1 兼容旧行为）
+- ✨ 飞书推送每行两个指标（移动端友好），去掉"买入/持有/卖出"标识
+- ✨ 飞书推送增加「连续第 1 N 天」展示，满仓信号（绿）/ 观察中（黄）
+- 🐛 修复软删除 ETF 仍出现在 candidates 表格的 bug（`INNER JOIN etf_pool ON is_active=1`）
+- 🐛 修复前端删除 ETF 后未刷新候选表格的 bug（`Promise.all([loadPool(), loadData()])`）
+- 📝 新增 `scripts/backup_db.py` 数据库热备份（SQLite `Connection.backup()`，WAL 安全）
+- 📝 README 完善：ETF 池管理 / 连续 N 天 / 数据库备份章节
 
 ### v2.0.0 (2026-08-29)
 

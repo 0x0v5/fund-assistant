@@ -3,7 +3,7 @@
 行业板块涨跌幅排名推送脚本
 
 两种调用方式：
-1. CLI（兼容 hermes cron）：`python scripts/industry_ranking.py`
+1. CLI：`python scripts/industry_ranking.py`
 2. APScheduler in-process：`from scripts.industry_ranking import run; await run()`
 
 环境变量：
