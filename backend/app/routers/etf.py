@@ -15,19 +15,20 @@ from typing import Optional
 import asyncio
 from fastapi import APIRouter, HTTPException
 
-from app.models.schemas import EtfSignal, EtfMomentum
+from app.models.schemas import EtfSignal, EtfMomentum, EtfPoolItem
 from app.services.crawler import fund_data
 from app.db.database import execute_update, execute_query, execute_many
 
 router = APIRouter()
 
-# 用户指定的 ETF 标的（双动量轮动）
-_MOMENTUM_ETFS = [
-    {"code": "159915", "name": "创业板ETF", "type": "国内"},
-    {"code": "512890", "name": "红利低波ETF", "type": "红利"},
-    {"code": "159941", "name": "纳指ETF", "type": "美股"},
-    {"code": "518880", "name": "黄金ETF", "type": "黄金"},
-]
+
+async def _load_pool_from_db() -> list[dict]:
+    """读 ETF 标的池（仅 active）。"""
+    return await execute_query("""
+        SELECT code, name, type, short_name, sort_order
+        FROM etf_pool WHERE is_active = 1
+        ORDER BY sort_order, id
+    """)
 
 
 def _compute_signal(combined: float, above_ma60: bool, factor_type: str = "return") -> str:
@@ -80,14 +81,16 @@ def _row_to_signal(row: dict, strategy: str) -> EtfSignal:
         current_price=row.get("current_price") or 0,
         above_ma60=above_ma60,
         update_date=row.get("calc_time", "")[:10] if row.get("calc_time") else "",
+        consecutive_rank1_days=int(row.get("consecutive_rank1_days") or 0),
     )
 
 
 async def _read_latest_from_db() -> tuple[list[EtfSignal], str]:
-    """读取每个 ETF 最新一条动量记录。
+    """读取每个 active ETF 最新一条动量记录。
 
     用 MAX(id) 而不是 MAX(calc_time)：id 是自增主键单调递增，
     不受系统时钟回拨影响，能正确选出"最近一次成功写入"的行。
+    JOIN etf_pool WHERE is_active=1：已软删除的 ETF 不参与前端排名。
     """
     rows = await execute_query("""
         SELECT m.* FROM momentum_history m
@@ -96,6 +99,7 @@ async def _read_latest_from_db() -> tuple[list[EtfSignal], str]:
             FROM momentum_history
             GROUP BY code
         ) latest ON m.id = latest.max_id
+        INNER JOIN etf_pool p ON p.code = m.code AND p.is_active = 1
     """)
     update_time = rows[0]["calc_time"] if rows else ""
     signals = [_row_to_signal(r, "aggressive") for r in rows]
@@ -137,6 +141,63 @@ async def _read_second_latest_top_code() -> Optional[str]:
     return candidates[0].code if candidates else None
 
 
+async def _calc_consecutive_rank1_for_refresh() -> dict[str, int]:
+    """计算当前最新批次中，每个 code 已连续多少天动量排名第一。
+
+    返回 {code: days}：仅包含当前批次的 code；非第一名 / 失败返回 0 / 不在字典中。
+    调用方在 save_momentum_history 时把不在字典中的 code 写 0。
+    """
+    try:
+        # 用 MAX(id) 取最新批次起点；与 _read_latest_from_db 思路一致
+        latest_ids_rows = await execute_query(
+            "SELECT MAX(id) AS max_id FROM momentum_history GROUP BY code"
+        )
+        if len(latest_ids_rows) < 1:
+            return {}
+        cursor_id = min(r["max_id"] for r in latest_ids_rows)
+        rows = await execute_query("""
+            WITH current_batch AS (
+                SELECT code, combined_score
+                FROM momentum_history
+                WHERE id >= ?
+            ),
+            current_rank1 AS (
+                SELECT code FROM current_batch
+                WHERE combined_score = (SELECT MAX(combined_score) FROM current_batch)
+            ),
+            prev_batch AS (
+                SELECT code, MAX(id) AS max_id
+                FROM momentum_history
+                WHERE id < ?
+                GROUP BY code
+            ),
+            prev_scores AS (
+                SELECT m.code, m.combined_score
+                FROM momentum_history m JOIN prev_batch p ON m.id = p.max_id
+            ),
+            prev_rank1 AS (
+                SELECT code FROM prev_scores
+                WHERE combined_score = (SELECT MAX(combined_score) FROM prev_scores)
+            ),
+            latest_each_code AS (
+                SELECT code, consecutive_rank1_days AS prev_days
+                FROM momentum_history
+                WHERE id IN (SELECT MAX(id) FROM momentum_history GROUP BY code)
+            )
+            SELECT r.code,
+                   CASE WHEN r.code IN (SELECT code FROM prev_rank1)
+                        THEN COALESCE(l.prev_days, 0) + 1
+                        ELSE 1
+                   END AS days
+            FROM current_rank1 r
+            LEFT JOIN latest_each_code l ON r.code = l.code
+        """, (cursor_id, cursor_id))
+        return {r["code"]: int(r["days"]) for r in rows}
+    except Exception as e:
+        print(f"计算连续第一名天数失败: {e}")
+        return {}
+
+
 # ============ API ============
 
 @router.get("/momentum", response_model=EtfMomentum)
@@ -144,7 +205,7 @@ async def get_momentum(strategy: str = "aggressive"):
     """获取 ETF 双动量轮动信号（从数据库读取，按 strategy 重算）。"""
     signals, update_time = await _read_latest_from_db()
 
-    # 按 strategy 重算 combined_score 和 signal（用 MAX(id) 选最新行，不受时钟回拨影响）
+    # 按 strategy 重算 combined_score 和 signal；JOIN etf_pool 过滤已软删除的 ETF
     candidates = []
     for row in await execute_query("""
         SELECT m.* FROM momentum_history m
@@ -153,6 +214,7 @@ async def get_momentum(strategy: str = "aggressive"):
             FROM momentum_history
             GROUP BY code
         ) latest ON m.id = latest.max_id
+        INNER JOIN etf_pool p ON p.code = m.code AND p.is_active = 1
     """):
         candidates.append(_row_to_signal(row, strategy))
 
@@ -163,21 +225,25 @@ async def get_momentum(strategy: str = "aggressive"):
     # 切换建议：对比上次刷新时的 top
     switch_suggestion = None
     prev_top_code = await _read_second_latest_top_code()
+    candidate_codes = {c.code for c in candidates}
     if prev_top_code and top_etf and top_etf.code != prev_top_code:
-        old_etf = next((c for c in candidates if c.code == prev_top_code), None)
-        if old_etf and top_etf.signal != "sell":
-            switch_suggestion = f"🔄 建议切换: {old_etf.name} → {top_etf.name}"
-        elif old_etf and top_etf.signal == "sell":
-            switch_suggestion = f"⚠️ {top_etf.name} 在60日线下，暂不切换"
+        # prev_top 已软删除（不在 candidates）时，跳过切换建议
+        if prev_top_code in candidate_codes:
+            old_etf = next((c for c in candidates if c.code == prev_top_code), None)
+            if old_etf and top_etf.signal != "sell":
+                switch_suggestion = f"🔄 建议切换: {old_etf.name} → {top_etf.name}"
+            elif old_etf and top_etf.signal == "sell":
+                switch_suggestion = f"⚠️ {top_etf.name} 在60日线下，暂不切换"
 
-    # 信号文案
+    # 信号文案：连续第一名达到门槛天数才推荐满仓；否则继续观察
+    consec_threshold = 3
     if top_etf:
         if top_etf.signal == "sell":
             signal_text = f"⚠️ {top_etf.name} 在60日线下方，建议观望"
-        elif switch_suggestion:
-            signal_text = f"📌 建议满仓: {top_etf.name}"
+        elif top_etf.consecutive_rank1_days >= consec_threshold:
+            signal_text = f"📌 建议满仓: {top_etf.name}（连续 {top_etf.consecutive_rank1_days} 天第一）"
         else:
-            signal_text = f"📌 继续持有: {top_etf.name}"
+            signal_text = f"📌 继续观察: {top_etf.name}（累计 {top_etf.consecutive_rank1_days} 天第一，未达 {consec_threshold} 天）"
     else:
         signal_text = "所有标的均在60日线下方，建议观望"
 
@@ -245,8 +311,15 @@ async def refresh_momentum():
     """触发计算 4 只 ETF 的动量指标并写入数据库；同时把收盘价同步到 fund_nav。"""
     try:
         calc_time = datetime.now().isoformat()
+        pool = await _load_pool_from_db()
+        if not pool:
+            return {"message": "ETF 池为空", "count": 0, "results": []}
+
+        # 一次性计算「连续第一名天数」，循环里复用
+        consec_map = await _calc_consecutive_rank1_for_refresh()
+
         results = []
-        for etf in _MOMENTUM_ETFS:
+        for etf in pool:
             code = etf["code"]
             name = etf["name"]
             momentum_data = await asyncio.to_thread(fund_data.calc_momentum, code, short_window=20, long_window=60)
@@ -284,10 +357,11 @@ async def refresh_momentum():
             combined = short_m * 1.0 + long_m * 0.0
             signal = _compute_signal(combined, above_ma60, factor_type="return")
 
+            consec_days = consec_map.get(code, 0)
             await save_momentum_history(code, name, short_m, long_m,
                                          round(combined, 2), signal, calc_time,
                                          daily_change, current_price, above_ma60,
-                                         short_sharpe)
+                                         short_sharpe, consec_days)
 
             # 同步日 K 收盘价到 fund_nav
             hist_df = await asyncio.to_thread(fund_data.get_etf_hist, code, days=90)
@@ -303,6 +377,7 @@ async def refresh_momentum():
                 "current_price": current_price,
                 "update_date": momentum_data.get("update_date", ""),
                 "nav_saved": nav_saved,
+                "consecutive_rank1_days": consec_days,
             })
 
         return {
@@ -319,7 +394,8 @@ async def refresh_momentum():
 async def save_momentum_history(code: str, name: str, short_m: float, medium_m: float,
                                   combined_score: float, signal: str, calc_time: str,
                                   daily_change: float, current_price: float, above_ma60: bool,
-                                  short_sharpe: float = 0):
+                                  short_sharpe: float = 0,
+                                  consecutive_rank1_days: int = 0):
     """保存动量数据到数据库。
 
     保留历史：每条记录独立写入；GET 接口用 MAX(id) 而不是 MAX(calc_time)，
@@ -329,10 +405,12 @@ async def save_momentum_history(code: str, name: str, short_m: float, medium_m: 
         await execute_update("""
             INSERT INTO momentum_history
             (code, name, short_momentum, medium_momentum, short_sharpe, combined_score,
-             signal, calc_time, daily_change, current_price, above_ma60)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             signal, calc_time, daily_change, current_price, above_ma60,
+             consecutive_rank1_days)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (code, name, short_m, medium_m, short_sharpe, combined_score,
-              signal, calc_time, daily_change, current_price, int(above_ma60)))
+              signal, calc_time, daily_change, current_price, int(above_ma60),
+              int(consecutive_rank1_days)))
     except Exception as e:
         print(f"保存动量数据失败: {e}")
 
@@ -340,8 +418,9 @@ async def save_momentum_history(code: str, name: str, short_m: float, medium_m: 
 @router.get("/compare-sources")
 async def compare_sources(strategy: str = "aggressive"):
     """对比新浪与腾讯数据源计算的动量指标差异。"""
+    pool = await _load_pool_from_db()
     results = []
-    for etf in _MOMENTUM_ETFS:
+    for etf in pool:
         code = etf["code"]
         name = etf["name"]
         sina = await asyncio.to_thread(fund_data.calc_momentum, code)
@@ -404,7 +483,50 @@ async def compare_sources(strategy: str = "aggressive"):
 @router.get("/candidates")
 async def get_candidates():
     """获取候选 ETF 列表."""
-    return {"candidates": _MOMENTUM_ETFS}
+    return {"candidates": await _load_pool_from_db()}
+
+
+# ============ ETF 标的池 CRUD ============
+
+@router.get("/pool")
+async def get_pool():
+    """读 ETF 标的池（含 inactive，便于前端管理 UI）。"""
+    rows = await execute_query("""
+        SELECT code, name, type, short_name, sort_order, is_active
+        FROM etf_pool
+        ORDER BY is_active DESC, sort_order, id
+    """)
+    return {"pool": rows}
+
+
+@router.post("/pool")
+async def add_pool_item(body: EtfPoolItem):
+    """新增 / 更新（同名 code 时 update）ETF 标的。"""
+    now_iso = datetime.now().isoformat()
+    await execute_update("""
+        INSERT INTO etf_pool (code, name, type, short_name, sort_order, is_active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+            name=excluded.name,
+            type=excluded.type,
+            short_name=excluded.short_name,
+            sort_order=excluded.sort_order,
+            is_active=1,
+            updated_at=excluded.updated_at
+    """, (body.code, body.name, body.type, body.short_name,
+          int(body.sort_order), now_iso, now_iso))
+    return {"message": "ok", "code": body.code}
+
+
+@router.delete("/pool/{code}")
+async def remove_pool_item(code: str):
+    """软删除 ETF 标的（is_active=0，保留历史数据）。"""
+    now_iso = datetime.now().isoformat()
+    await execute_update(
+        "UPDATE etf_pool SET is_active=0, updated_at=? WHERE code=?",
+        (now_iso, code),
+    )
+    return {"message": "ok", "code": code}
 
 
 @router.get("/history")
@@ -457,4 +579,5 @@ async def get_etf_detail(code: str):
         "above_ma60": bool(row.get("above_ma60")),
         "update_date": (row.get("calc_time") or "")[:10],
         "calc_time": row.get("calc_time"),
+        "consecutive_rank1_days": int(row.get("consecutive_rank1_days") or 0),
     }

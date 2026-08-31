@@ -12,9 +12,9 @@
 - tenant_access_token 进程内缓存；剩余有效期 < 600 秒时主动刷新，避免边界过期。
 - 失败重试 3 次（0s / 30s / 60s 退避），覆盖 token 过期 / 网络抖动场景。
 - 彻底失败时返回 False，由调用方决定是否 sys.exit(1)。
-- 注意：当前仅实现文本推送（msg_type=text）。run_momentum.py 生成的表格
-  PNG 会以 `MEDIA:<path>` 文本形式留在消息里；如需图片可扩展 msg_type=image
-  或 interactive 卡片。
+- 注意：当前仅实现纯文本推送（msg_type=text）。如需图片 / 卡片，
+  请用 `requests` 直接调 https://open.feishu.cn/open-apis/im/v1/images 等端点
+  （msg_type=image 需要先 upload image_key，msg_type=interactive 需要 template_id）。
 """
 
 import os

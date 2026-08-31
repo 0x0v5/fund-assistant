@@ -1,6 +1,7 @@
 """SQLite database connection and setup."""
 
 import aiosqlite
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -9,9 +10,22 @@ from contextlib import asynccontextmanager
 DB_PATH = Path(__file__).parent.parent.parent.parent / "data" / "fund.db"
 
 
+async def _apply_pragmas(db):
+    """SQLite tuning — apply on every connection.
+
+    - journal_mode=WAL: 读写并发 + 断电保护（写时不会阻塞读，反之亦然）
+    - synchronous=NORMAL: WAL 模式下安全折中（FULL 太慢，OFF 丢数据）
+    - cache_size=-2000: 2MB 页缓存（N1 内存紧，控一下用量）
+    """
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA synchronous=NORMAL")
+    await db.execute("PRAGMA cache_size=-2000")
+
+
 async def init_db():
     """Initialize database tables."""
     async with aiosqlite.connect(DB_PATH) as db:
+        await _apply_pragmas(db)
         # QDII 额度表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS qdii_quota (
@@ -130,6 +144,36 @@ async def init_db():
             )
         """)
 
+        # ETF 标的池（双动量轮动策略；前端可 CRUD）
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS etf_pool (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT '其他',
+                short_name TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
+
+        # 默认 ETF 池（4 只历史硬编码标的；INSERT OR IGNORE 保证幂等）
+        default_etfs = [
+            ("159915", "创业板ETF",   "国内", "创业", 0),
+            ("512890", "红利低波ETF", "红利", "红利", 1),
+            ("159941", "纳指ETF",     "美股", "纳指", 2),
+            ("518880", "黄金ETF",     "黄金", "黄金", 3),
+        ]
+        now_iso = datetime.now().isoformat()
+        for code, name, etype, short, order in default_etfs:
+            await db.execute("""
+                INSERT OR IGNORE INTO etf_pool
+                    (code, name, type, short_name, sort_order, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """, (code, name, etype, short, order, now_iso, now_iso))
+
         # 回测运行表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS backtest_runs (
@@ -196,6 +240,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy_created ON backtest_runs(strategy_type, created_at DESC)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_backtest_daily_run_date ON backtest_daily_values(run_id, date)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades(run_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_etf_pool_active_order ON etf_pool(is_active, sort_order)")
 
         await db.commit()
 
@@ -206,9 +251,11 @@ async def init_db():
         ("fund_eval_history", "return_1y_pct", "REAL"),
         ("fund_eval_history", "fund_type", "TEXT"),
         ("momentum_history", "short_sharpe", "REAL"),
+        ("momentum_history", "consecutive_rank1_days", "INTEGER"),
         ("industry_funds", "data_source", "TEXT"),
     ]
     async with aiosqlite.connect(DB_PATH) as db:
+        await _apply_pragmas(db)
         for table, col, col_type in migrations:
             try:
                 await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
@@ -219,6 +266,7 @@ async def init_db():
 
     # 迁移：行业基金表从 code 唯一改为 (code, update_time) 唯一，保留历史
     async with aiosqlite.connect(DB_PATH) as db:
+        await _apply_pragmas(db)
         try:
             # 检查是否存在旧版 code 唯一约束（auto-index origin='u'）
             cur = await db.execute("PRAGMA index_list('industry_funds')")
@@ -273,6 +321,7 @@ async def get_db():
     """Get database connection as context manager."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(DB_PATH)
+    await _apply_pragmas(db)
     try:
         yield db
     finally:

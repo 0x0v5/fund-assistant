@@ -143,6 +143,17 @@ class EtfDualMomentumStrategy(BacktestStrategy):
                 "required": True,
             },
             {
+                "name": "consecutive_rank1_days",
+                "type": "number",
+                "label": "连续第一名天数门槛",
+                "default": 3,
+                "min": 1,
+                "max": 30,
+                "step": 1,
+                "required": True,
+                "description": "ETF 需连续 N 天排名第一才买入；=1 退化为旧行为（只看当天排名）",
+            },
+            {
                 "name": "rebalance_freq",
                 "type": "select",
                 "label": "调仓频率",
@@ -216,6 +227,7 @@ class EtfDualMomentumStrategy(BacktestStrategy):
         short_window = int(params.get("short_window", 20))
         ma_window = int(params.get("ma_window", 60))
         factor_type = params.get("factor_type", "return")
+        consec_n = int(params.get("consecutive_rank1_days", 3))
 
         momentum = {}
         ma = {}
@@ -229,11 +241,65 @@ class EtfDualMomentumStrategy(BacktestStrategy):
                 momentum[f"{code}_short"] = self._calc_return_momentum(prices, short_window)
             ma[code] = prices.rolling(window=ma_window).mean()
 
+        # 预先计算「连续第一名天数」矩阵：date × code，仅在 use_ma_filter + buy_threshold
+        # 双过滤后的有效 ETF 中按 combined_score 排；并列最高分都算 rank=1。
+        # 非 rank=1 的位置写 0，表示当日不满足「连续 N 天第一」前置条件。
+        scores_df = pd.DataFrame(momentum).reindex(prices_df.index)
+        use_ma_filter = bool(params.get("use_ma_filter", True))
+        buy_threshold = float(params.get("buy_threshold", 3.0))
+
+        # valid 矩阵：date × code 布尔
+        valid_mask = pd.DataFrame(True, index=scores_df.index, columns=codes)
+        if use_ma_filter:
+            ma_df = pd.DataFrame(ma).reindex(prices_df.index)
+            for code in codes:
+                if code not in ma_df.columns:
+                    valid_mask[code] = False
+                    continue
+                valid_mask[code] = (
+                    scores_df[f"{code}_short"].notna()
+                    & ma_df[code].notna()
+                    & (prices_df[code] > ma_df[code])
+                )
+        else:
+            for code in codes:
+                valid_mask[code] = scores_df[f"{code}_short"].notna()
+
+        if factor_type == "sharpe":
+            for code in codes:
+                valid_mask[code] = valid_mask[code] & (scores_df[f"{code}_short"] > 0)
+        else:
+            for code in codes:
+                valid_mask[code] = valid_mask[code] & (scores_df[f"{code}_short"] > buy_threshold)
+
+        # rank_df：date × code，valid=True 中按 combined_score 降序排；并列最高分均置 1
+        rank_df = pd.DataFrame(0, index=scores_df.index, columns=codes, dtype=float)
+        for date in scores_df.index:
+            row_scores = {}
+            for code in codes:
+                if valid_mask.loc[date, code]:
+                    row_scores[code] = scores_df.loc[date, f"{code}_short"]
+            if not row_scores:
+                continue
+            max_score = max(row_scores.values())
+            for code, s in row_scores.items():
+                if s == max_score:
+                    rank_df.loc[date, code] = 1
+
+        # consec_df：date × code，连续 rank=1 的天数；非 rank=1 置 0
+        consec_df = pd.DataFrame(0, index=scores_df.index, columns=codes, dtype=int)
+        for code in codes:
+            is_rank1 = (rank_df[code] == 1).fillna(False)
+            # 用 (non-rank1) cumsum 切段，每段内 cumcount = 连续 rank1 天数
+            consec_df[code] = is_rank1.groupby((~is_rank1).cumsum()).cumcount()
+
         return {
-            "momentum": pd.DataFrame(momentum).reindex(prices_df.index),
+            "momentum": scores_df,
             "ma": pd.DataFrame(ma).reindex(prices_df.index),
             "codes": codes,
             "factor_type": factor_type,
+            "consec_df": consec_df,
+            "consec_n": consec_n,
         }
 
     def on_rebalance_day(
@@ -248,6 +314,8 @@ class EtfDualMomentumStrategy(BacktestStrategy):
         mom_df = prepared_data["momentum"]
         ma_df = prepared_data["ma"]
         codes = prepared_data["codes"]
+        consec_df = prepared_data.get("consec_df")
+        consec_n = int(prepared_data.get("consec_n", params.get("consecutive_rank1_days", 3)))
         use_ma_filter = bool(params.get("use_ma_filter", True))
         buy_threshold = float(params.get("buy_threshold", 3.0))
         top_n = int(params.get("top_n", 1))
@@ -274,6 +342,13 @@ class EtfDualMomentumStrategy(BacktestStrategy):
                     continue
             else:
                 if combined <= buy_threshold:
+                    continue
+
+            # 连续第一名门槛：precomputed consec_df 算的是 rank=1 连续天数
+            # 这里要求「≥ consec_n 才买入」，避免单日第一名噪声
+            if consec_n > 1 and consec_df is not None and date in consec_df.index:
+                days = consec_df.loc[date, code]
+                if pd.isna(days) or int(days) < consec_n:
                     continue
 
             scores[code] = combined

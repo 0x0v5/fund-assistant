@@ -34,6 +34,10 @@ export const etfApi = {
   getHistory: () => api.get('/etf/history'),
   refreshMomentum: () => api.post('/etf/momentum/refresh'),
   compareSources: (strategy: string = 'aggressive') => api.get('/etf/compare-sources', { params: { strategy } }),
+  getPool: () => api.get('/etf/pool'),
+  addPoolItem: (item: { code: string; name: string; type: string; short_name?: string; sort_order?: number }) =>
+    api.post('/etf/pool', item),
+  removePoolItem: (code: string) => api.delete(`/etf/pool/${code}`),
 }
 
 // 行业基金 API

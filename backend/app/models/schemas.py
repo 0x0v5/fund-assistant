@@ -52,6 +52,15 @@ class EtfSignal(BaseModel):
     current_price: float = 0  # 当前价格
     above_ma60: bool = False  # 当前价格是否大于 60 日线
     update_date: Optional[str] = None  # 更新日期
+    consecutive_rank1_days: int = 0  # 连续 N 天动量排名第一
+
+
+class EtfPoolItem(BaseModel):
+    code: str
+    name: str
+    type: str = "其他"
+    short_name: Optional[str] = None
+    sort_order: int = 0
 
 
 class EtfMomentum(BaseModel):

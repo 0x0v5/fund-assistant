@@ -3,20 +3,20 @@
 ETF 双动量轮动策略执行脚本
 
 两种调用方式：
-1. CLI（兼容 hermes cron）：`python scripts/run_momentum.py`
+1. CLI：`python scripts/run_momentum.py`
 2. APScheduler in-process：`from scripts.run_momentum import run; await run()`
 
 环境变量：
 - FUND_API_BASE  后端 API 地址（默认 http://localhost:8000）
 - PREVIEW=1      只生成本地预览，不推送飞书
-- SKIP_CHART=1   跳过图片生成（飞书无图权限时回退纯文本）
+
+推送格式：纯文本（msg_type=text），风格对齐 fetch_qdii.py / industry_ranking.py。
 """
 
 import httpx
 import asyncio
 import os
 import sys
-import tempfile
 from datetime import datetime
 from typing import Optional
 
@@ -24,56 +24,28 @@ from feishu_sender import send as send_feishu
 
 API_BASE = os.environ.get("FUND_API_BASE", "http://localhost:8000")
 
-# 标的短名映射（≤3 字）
-SHORT_NAME = {
-    "159915": "创业",
-    "512890": "红利",
-    "159941": "纳指",
-    "518880": "黄金",
-}
-ALL_CODES = list(SHORT_NAME.keys())
-
-# 中国股市惯例颜色
-RED = "#f56c6c"    # 正数红
-GREEN = "#67c23a"  # 负数绿
-YELLOW = "#e6a23c"
-GRAY = "#909399"
-TEXT = "#303133"
-BG_HEADER = "#fafafa"
-BG_ROW_ALT = "#f8f9fa"
-
-# matplotlib 配置
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib import font_manager
-
-ZH_FONT_CANDIDATES = ["PingFang SC", "Heiti SC", "STHeiti", "Hiragino Sans GB", "Microsoft YaHei"]
-_AVAILABLE_FONTS = {f.name for f in font_manager.fontManager.ttflist}
-for _name in ZH_FONT_CANDIDATES:
-    if _name in _AVAILABLE_FONTS:
-        plt.rcParams["font.sans-serif"] = [_name, "DejaVu Sans"]
-        break
-plt.rcParams["axes.unicode_minus"] = False
-
-def _colored(value: float, fmt: str = "+.2f") -> str:
-    """按中国股市惯例：正数红 / 负数绿，返回带 emoji 前缀的字符串。"""
-    icon = "🔴" if value >= 0 else "🟢"
-    return f"{icon}{value:{fmt}}"
+# 标的池从 API 动态加载；进程内缓存，每次 run() 刷新一次
+_POOL_CACHE: dict[str, str] = {}
 
 
-def _sign_colored(value: float) -> str:
-    """只显示正负号 + 颜色（用于动量2）。"""
-    icon = "🔴" if value >= 0 else "🟢"
-    return f"{icon}+" if value >= 0 else f"{icon}-"
-
-
-SIG_EMOJI = {"buy": "🟢", "hold": "🟡", "sell": "🔴"}
-SIG_TEXT = {"buy": "买入", "hold": "持有", "sell": "卖出"}
+async def _refresh_pool_cache() -> None:
+    """每次推送前重新拉一次池子，确保前端新增/删除生效。"""
+    global _POOL_CACHE
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{API_BASE}/api/etf/pool")
+            r.raise_for_status()
+            _POOL_CACHE = {
+                it["code"]: (it.get("short_name") or it.get("name", ""))[:3]
+                for it in r.json().get("pool", [])
+                if it.get("code") and int(it.get("is_active", 1)) == 1
+            }
+    except Exception as e:
+        print(f"警告: 拉取 ETF 池子失败: {e}（沿用上次缓存）")
 
 
 def short_name(code: str, fallback: str = "") -> str:
-    return SHORT_NAME.get(code, fallback[:3] if fallback else code[:3])
+    return _POOL_CACHE.get(code, fallback[:3] if fallback else code[:3])
 
 
 def _rank_by(candidates: list[dict], key: str) -> dict[str, int]:
@@ -94,14 +66,12 @@ async def fetch_all_strategies() -> tuple[dict, dict]:
 
 
 def _build_rows(aggressive: dict, conservative: dict) -> list[dict]:
-    """把两种策略的数据合并成一行/标的的统一视图，按激进评分降序。"""
+    """把两种策略的数据合并成一行/标的的统一视图，按夏普评分降序。"""
     agg_by = {c.get("code"): c for c in aggressive.get("candidates", [])}
     con_by = {c.get("code"): c for c in conservative.get("candidates", [])}
-    agg_rank = _rank_by(aggressive.get("candidates", []), "combined_score")
-    con_rank = _rank_by(conservative.get("candidates", []), "combined_score")
 
     rows = []
-    for code in ALL_CODES:
+    for code in _POOL_CACHE.keys():
         a = agg_by.get(code)
         if not a:
             continue
@@ -114,188 +84,97 @@ def _build_rows(aggressive: dict, conservative: dict) -> list[dict]:
             "daily": float(a.get("daily_change", 0)),
             "agg_score": float(a.get("combined_score", 0)),
             "con_score": float(c.get("combined_score", 0)),
-            "signal": a.get("signal", "hold"),
-            "agg_rank": agg_rank.get(code, "-"),
-            "con_rank": con_rank.get(code, "-"),
+            "consec": int(a.get("consecutive_rank1_days", 0)),
         })
     rows.sort(key=lambda r: r["con_score"], reverse=True)
     return rows
 
 
-def format_message(aggressive: dict, conservative: dict, switch_suggestion: str = "") -> str:
-    """生成简明文案：仅第一名（夏普评分第一名）+ 切换提示。完整 4 行由图片表格承载。"""
-    now = datetime.now()
+def format_message(aggressive: dict, conservative: dict, switch_hint: str = "") -> str:
+    """生成纯文本消息（对齐 fetch_qdii.py / industry_ranking.py 风格）。
+
+    移动端友好：每行两个指标（空格分隔），避免窄屏自动换行错位。
+
+    第一名专属块额外展示「连续第 1 N 天」（核心策略信号：达 3 天才满仓）。
+
+    颜色规则（中国股市惯例）：
+      涨跌：🔴 正 / 🟢 负
+      60 日线：🔴 上方 / 🟢 下方
+    """
     update_time = aggressive.get("last_update") or conservative.get("last_update") or ""
-    time_str = update_time[:16].replace("T", " ") if update_time else now.strftime("%Y-%m-%d %H:%M")
+    time_str = update_time[:19].replace("T", " ") if update_time else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     rows = _build_rows(aggressive, conservative)
-    # 第一名 = 夏普评分第一名（表格也已按 con_score 排序）
     top = rows[0] if rows else None
 
-    lines = [
-        "📈 ETF 双动量轮动",
-        f"⏱️ {time_str}",
-        "",
-    ]
+    lines = ["📈 ETF 双动量轮动"]
+    lines.append(f"更新时间: {time_str}")
+    lines.append("")
+
+    def _block(r) -> list[str]:
+        daily_icon = "🔴" if r["daily"] >= 0 else "🟢"
+        short_icon = "🔴" if r["short"] >= 0 else "🟢"
+        score_icon = "🔴" if r["con_score"] >= 0 else "🟢"
+        above_icon = "🔴" if r["above_ma60"] else "🟢"
+        above_label = "60日线上" if r["above_ma60"] else "60日线下"
+        return [
+            f"今日 {daily_icon}{r['daily']:+.2f}%   短期 {short_icon}{r['short']:+.2f}%",
+            f"{above_icon}{above_label}   评分 {score_icon}{r['con_score']:+.2f}",
+        ]
 
     if top:
-        sig_label = SIG_TEXT.get(top["signal"], "?")
-        sig_emoji = SIG_EMOJI.get(top["signal"], "")
-        lines.append(
-            f"🥇 第一名: {top['name']} "
-            f"{_colored(top['con_score'], '+.2f')} "
-            f"{sig_emoji}{sig_label}"
-        )
-
-    if switch_suggestion:
+        lines.append(f"🥇 第一名：{top['name']}")
+        lines.extend(_block(top))
+        # 「连续第 1」专属块：达 3 天 🟢 已满仓信号；1-2 天 🟡 观察中
+        consec_days = int(top.get("consec", 0))
+        if consec_days >= 3:
+            lines.append(f"🟢 连续第1: {consec_days} 天（已达 3 天门槛，满仓信号）")
+        elif consec_days >= 1:
+            lines.append(f"🟡 连续第1: {consec_days} 天（未达 3 天门槛，继续观察）")
         lines.append("")
-        lines.append(switch_suggestion)
 
+    lines.append("【完整排名】按夏普评分")
+    for i, r in enumerate(rows, 1):
+        score_icon = "🔴" if r["con_score"] >= 0 else "🟢"
+        consec_days = int(r.get("consec", 0))
+        consec_str = f"   连1:{consec_days}天" if consec_days > 0 else ""
+        lines.append(f"{score_icon} {i}. {r['name']} ({r['code']}){consec_str}")
+        lines.extend(_block(r))
+        lines.append("")
+
+    if switch_hint:
+        lines.append(f"💡 切换建议: {switch_hint}")
+
+    # 去掉末尾连续空行
+    while lines and lines[-1] == "":
+        lines.pop()
     return "\n".join(lines)
 
 
-def render_table_image(rows: list[dict], update_time: str) -> str:
-    """生成红绿着色表格图片，对齐前端 EtfMomentum.vue 列定义：
-    标的 / 今日涨跌 / 短期(20日) / 60日线上方 / 综合评分 / 信号
-
-    60 日线上方字段直接取自 API 的 `above_ma60` 布尔值，
-    与前端页面展示一致（true=在 60 日线上方 / false=在 60 日线下方）。
-    """
-    # 列定义：(header, width, builder_func)
-    # builder_func(r) -> (text, color, fontweight)
-    def col_name(r):
-        return (r["name"], TEXT, "bold")
-
-    def col_today(r):
-        v = r["daily"]
-        return (f"{v:+.2f}%", RED if v >= 0 else GREEN, "normal")
-
-    def col_short(r):
-        # 短期 20 日涨幅（对齐前端 short_momentum）
-        v = r["short"]
-        return (f"{v:+.1f}%", RED if v >= 0 else GREEN, "normal")
-
-    def col_above_ma60(r):
-        # 60 日线上方（对齐前端 above_ma60，不再使用 medium_momentum 二值化）
-        above = bool(r["above_ma60"])
-        text = "true" if above else "false"
-        return (text, GREEN if above else RED, "bold")
-
-    def col_sharpe(r):
-        v = r["con_score"]
-        return (f"{v:+.2f}", RED if v >= 0 else GREEN, "normal")
-
-    def col_signal(r):
-        s = r["signal"]
-        color = {"buy": GREEN, "hold": YELLOW, "sell": RED}.get(s, GRAY)
-        return ({"buy": "买入", "hold": "持有", "sell": "卖出"}.get(s, s), color, "bold")
-
-    columns = [
-        ("标的", 1.0, col_name),
-        ("今日涨跌", 1.1, col_today),
-        ("短期(20日)", 1.3, col_short),
-        ("60日线上方", 1.4, col_above_ma60),
-        ("综合评分", 1.1, col_sharpe),
-        ("信号", 1.0, col_signal),
-    ]
-
-    n_rows = len(rows) + 1  # +1 header
-    n_cols = len(columns)
-    col_widths = [c[1] for c in columns]
-    total_w = sum(col_widths)
-
-    cell_h = 1.0
-    fig_w = total_w * 1.2
-    fig_h = n_rows * cell_h + 0.6
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=140)
-    fig.patch.set_facecolor("white")
-    ax.set_xlim(0, total_w)
-    ax.set_ylim(0, n_rows * cell_h)
-    ax.axis("off")
-
-    for i in range(n_rows):
-        x_left = 0
-        for j, w in enumerate(col_widths):
-            if i == 0:
-                bg = BG_HEADER
-            elif i % 2 == 1:
-                bg = "white"
-            else:
-                bg = BG_ROW_ALT
-            ax.add_patch(plt.Rectangle(
-                (x_left, (n_rows - 1 - i) * cell_h), w, cell_h,
-                facecolor=bg, edgecolor="#e4e7ed", linewidth=0.7, zorder=0,
-            ))
-            x_left += w
-
-    time_str = (update_time or datetime.now().isoformat())[:16].replace("T", " ")
-    ax.text(total_w / 2, n_rows * cell_h + 0.25,
-             f"ETF 双动量轮动（按夏普评分排序）   {time_str}",
-             ha="center", va="center", fontsize=13, fontweight="bold", color=TEXT)
-
-    x_left = 0
-    for j, (header, w, _) in enumerate(columns):
-        cx = x_left + w / 2
-        cy = (n_rows - 1) * cell_h + cell_h / 2
-        ax.text(cx, cy, header, ha="center", va="center",
-                 fontsize=11, fontweight="bold", color=TEXT)
-        x_left += w
-
-    for i, r in enumerate(rows):
-        x_left = 0
-        for j, (_, w, builder) in enumerate(columns):
-            text, color, weight = builder(r)
-            cx = x_left + w / 2
-            cy = (n_rows - 2 - i) * cell_h + cell_h / 2
-            ax.text(cx, cy, text, ha="center", va="center",
-                     fontsize=12, color=color, fontweight=weight)
-            x_left += w
-
-    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-
-    fd, path = tempfile.mkstemp(prefix="etf_table_", suffix=".png")
-    os.close(fd)
-    plt.savefig(path, dpi=140, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-    return path
-
-
-async def run(preview_only: Optional[bool] = None, skip_chart: Optional[bool] = None) -> bool:
-    """执行 ETF 双动量计算 + 飞书推送全流程。
+async def run(preview_only: Optional[bool] = None) -> bool:
+    """执行 ETF 双动量计算 + 飞书纯文本推送全流程。
 
     Args:
         preview_only: True 只打印不推送；None 时从环境变量 PREVIEW 读取
-        skip_chart: True 跳过表格图片生成；None 时从环境变量 SKIP_CHART 读取
 
     Returns:
-        True 流程完成（含 preview 模式）；False 抓取/推送失败
+        True 流程完成；False 抓取/推送失败
     """
     if preview_only is None:
         preview_only = os.environ.get("PREVIEW", "").lower() in ("1", "true", "yes")
-    if skip_chart is None:
-        skip_chart = os.environ.get("SKIP_CHART", "").lower() in ("1", "true", "yes")
 
     print(f"[{datetime.now().isoformat()}] 开始 ETF 动量计算...")
 
-    chart_path = ""
     try:
+        # 先拉池子（前端新增/删除立即生效；失败时沿用上次缓存）
+        await _refresh_pool_cache()
+        if not _POOL_CACHE:
+            print("警告: ETF 池子为空，跳过本次推送", file=sys.stderr)
+            return False
+
         aggressive, conservative = await fetch_all_strategies()
-        rows = _build_rows(aggressive, conservative)
-        update_time = aggressive.get("last_update") or conservative.get("last_update") or ""
         switch_hint = aggressive.get("switch_suggestion") or conservative.get("switch_suggestion") or ""
         message = format_message(aggressive, conservative, switch_hint)
-
-        if skip_chart:
-            print("已设置 SKIP_CHART=1，跳过图片生成")
-        else:
-            try:
-                chart_path = render_table_image(rows, update_time)
-                print(f"表格图片已生成: {chart_path}")
-            except Exception as e:
-                print(f"图片生成失败（不影响文本推送）: {e}")
-
-        if chart_path and os.path.exists(chart_path):
-            message = f"{message}\n\nMEDIA:{chart_path}"
 
         if preview_only:
             print()
@@ -319,13 +198,6 @@ async def run(preview_only: Optional[bool] = None, skip_chart: Optional[bool] = 
     except Exception as e:
         print(f"错误: {e}", file=sys.stderr)
         return False
-    finally:
-        # 预览模式保留图片；推送后清理
-        if not preview_only and chart_path and os.path.exists(chart_path):
-            try:
-                os.remove(chart_path)
-            except Exception:
-                pass
 
 
 async def main():

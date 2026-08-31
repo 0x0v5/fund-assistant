@@ -30,6 +30,8 @@ services:
       # 源码 bind mount：改 backend/scripts/*.py 后 docker compose restart 即生效，免 rebuild
       - ./backend:/app/backend
       - ./scripts:/app/scripts
+      # supervisord 配置 bind mount（覆盖镜像内的旧版 run.py 命令）
+      - ./supervisord.conf:/etc/supervisor/conf.d/supervisord.conf:ro
 
     deploy:
       resources:

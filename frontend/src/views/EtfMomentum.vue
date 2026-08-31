@@ -8,12 +8,66 @@
             <el-radio-button label="aggressive">激进型</el-radio-button>
             <el-radio-button label="conservative">保守型</el-radio-button>
           </el-radio-group>
+          <el-button @click="poolDrawerOpen = true" plain>
+            <el-icon><Setting /></el-icon>
+            标的池管理
+          </el-button>
           <el-button type="primary" @click="manualRefresh" :loading="loading">
             <el-icon><Refresh /></el-icon>
             更新数据
           </el-button>
         </div>
       </div>
+
+      <!-- ETF 标的池管理抽屉 -->
+      <el-drawer v-model="poolDrawerOpen" title="ETF 标的池管理" direction="rtl" size="500px">
+        <div class="pool-drawer-content">
+          <el-table :data="poolList" stripe>
+            <el-table-column prop="code" label="代码" width="100" />
+            <el-table-column prop="name" label="名称" width="160" />
+            <el-table-column prop="short_name" label="短名" width="80" />
+            <el-table-column prop="type" label="类型" width="90" />
+            <el-table-column label="操作" width="80" align="center">
+              <template #default="{ row }">
+                <el-button v-if="row.is_active" type="danger" size="small" link @click="removePool(row)">
+                  删除
+                </el-button>
+                <el-tag v-else size="small" type="info">已停用</el-tag>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <el-divider>新增 ETF</el-divider>
+          <el-form :model="newPoolItem" label-width="80px" size="default">
+            <el-form-item label="代码">
+              <el-input v-model="newPoolItem.code" placeholder="如 159915" />
+            </el-form-item>
+            <el-form-item label="名称">
+              <el-input v-model="newPoolItem.name" placeholder="如 创业板ETF" />
+            </el-form-item>
+            <el-form-item label="短名">
+              <el-input v-model="newPoolItem.short_name" placeholder="≤3 字，飞书推送显示" />
+            </el-form-item>
+            <el-form-item label="类型">
+              <el-select v-model="newPoolItem.type" placeholder="选择类型" style="width: 100%">
+                <el-option label="国内" value="国内" />
+                <el-option label="红利" value="红利" />
+                <el-option label="美股" value="美股" />
+                <el-option label="黄金" value="黄金" />
+                <el-option label="债券" value="债券" />
+                <el-option label="商品" value="商品" />
+                <el-option label="其他" value="其他" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="排序">
+              <el-input-number v-model="newPoolItem.sort_order" :min="0" :max="999" />
+            </el-form-item>
+            <el-form-item>
+              <el-button type="primary" @click="addPool" :loading="poolSaving">添加</el-button>
+            </el-form-item>
+          </el-form>
+        </div>
+      </el-drawer>
 
       <!-- 持仓建议 -->
       <div class="holding-recommendation">
@@ -31,6 +85,7 @@
               <span>综合评分: <span class="score">{{ topEtf.combined_score }}</span></span>
               <span>短期动量: <span :class="getMomentumClass(topEtf.short_momentum)">{{ topEtf.short_momentum }}%</span></span>
               <span>60日线上方: <span :class="getAboveMa60Class(topEtf.above_ma60)">{{ topEtf.above_ma60 }}</span></span>
+              <span>连续第1: <span class="score">{{ topEtf.consecutive_rank1_days || 0 }} 天</span></span>
             </div>
           </div>
           <div class="rank-badge">🥇 排名第1</div>
@@ -78,6 +133,13 @@
               </span>
             </template>
           </el-table-column>
+          <el-table-column prop="consecutive_rank1_days" label="连续第1天数" width="120" sortable>
+            <template #default="{ row }">
+              <el-tag :type="(row.consecutive_rank1_days || 0) >= 3 ? 'success' : 'info'" size="small">
+                {{ row.consecutive_rank1_days || 0 }} 天
+              </el-tag>
+            </template>
+          </el-table-column>
           <el-table-column prop="combined_score" label="综合评分" width="100" sortable>
             <template #default="{ row }">
               <span :class="getScoreClass(row.combined_score)">
@@ -97,11 +159,10 @@
         <el-icon><InfoFilled /></el-icon>
         <div>
           <strong>双动量策略说明：</strong><br>
-          - 满仓持有综合评分排名第1的ETF<br>
+          - 连续 N 天动量排名第一才推荐买入（连续天数 ≤ 1 时仅按当日排名推荐）<br>
           - 价格需站在60日线上方才参与排名（趋势过滤）<br>
           - 激进型：综合评分 = 100% 短期涨幅 (20日)，买入阈值 > 3<br>
           - 保守型：综合评分 = 20日夏普比率 (mean/std × √252)，买入阈值 > 0<br>
-          - 每周五根据排名变化给出切换建议<br>
           <span v-if="updateTime">- 数据更新于: {{ updateTime }}</span>
         </div>
       </div>
@@ -161,9 +222,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import { WarningFilled, InfoFilled, Refresh } from '@element-plus/icons-vue'
+import { ref, computed, onMounted, watch } from 'vue'
+import { WarningFilled, InfoFilled, Refresh, Setting } from '@element-plus/icons-vue'
 import { etfApi } from '@/api'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 const strategy = ref('aggressive')
 const holdings = ref<any[]>([])
@@ -174,6 +236,12 @@ const updateTime = ref('')
 const loading = ref(false)
 
 const sourceCompare = ref<any[]>([])
+
+// 标的池管理
+const poolDrawerOpen = ref(false)
+const poolList = ref<any[]>([])
+const poolSaving = ref(false)
+const newPoolItem = ref({ code: '', name: '', short_name: '', type: '其他', sort_order: 0 })
 
 const topEtf = computed(() => candidates.value[0] || null)
 
@@ -267,6 +335,70 @@ const manualRefresh = async () => {
     loading.value = false
   }
 }
+
+// ============ 标的池管理 ============
+
+const loadPool = async () => {
+  try {
+    const res = await etfApi.getPool()
+    poolList.value = res.data.pool || []
+  } catch (error) {
+    console.error('读取 ETF 池子失败:', error)
+  }
+}
+
+const resetNewPoolItem = () => {
+  newPoolItem.value = { code: '', name: '', short_name: '', type: '其他', sort_order: 0 }
+}
+
+const addPool = async () => {
+  if (!newPoolItem.value.code || !newPoolItem.value.name) {
+    ElMessage.warning('代码和名称必填')
+    return
+  }
+  poolSaving.value = true
+  try {
+    await etfApi.addPoolItem({
+      code: newPoolItem.value.code.trim(),
+      name: newPoolItem.value.name.trim(),
+      short_name: newPoolItem.value.short_name.trim() || undefined,
+      type: newPoolItem.value.type,
+      sort_order: newPoolItem.value.sort_order,
+    })
+    ElMessage.success('添加成功')
+    resetNewPoolItem()
+    await Promise.all([loadPool(), loadData()])
+  } catch (error: any) {
+    console.error('添加 ETF 失败:', error)
+    ElMessage.error(error?.response?.data?.detail || '添加失败')
+  } finally {
+    poolSaving.value = false
+  }
+}
+
+const removePool = async (row: any) => {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除 ${row.name} (${row.code})？删除后将不再参与轮动排名。`,
+      '删除 ETF',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+  try {
+    await etfApi.removePoolItem(row.code)
+    ElMessage.success('已删除')
+    await Promise.all([loadPool(), loadData()])
+  } catch (error) {
+    console.error('删除 ETF 失败:', error)
+    ElMessage.error('删除失败')
+  }
+}
+
+watch(poolDrawerOpen, (open) => {
+  if (open) loadPool()
+})
 
 onMounted(() => {
   loadData()
